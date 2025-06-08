@@ -14,14 +14,14 @@ This system ensures strong encryption, reduced correlation, high unpredictabilit
 ## 📂 Repository Structure
 
 ```
-📁 Draw.io files                  → Architecture and diagram sources  
+📁 Draw.io files                 → Architecture and diagram sources  
 📁 Final_Training                → Final training data, logs or models  
 📁 Medical_Images_for_rough_test → Sample medical images used for testing  
 📁 Models                        → Saved GAN models  
 📁 PythonFiles                   → Utility and core implementation scripts  
 📁 WGAN_GP_working               → WGAN-GP training and evaluation logic  
 📁 ppts                          → Project presentation slides  
-📄 simple_ui_using_TKinter.py   → UI demo for image-key generation  
+📄 simple_ui_using_TKinter.py    → UI demo for image-key generation  
 📄 README.md                     → This file  
 ```
 
