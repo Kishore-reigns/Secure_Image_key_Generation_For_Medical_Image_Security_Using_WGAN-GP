@@ -1,0 +1,394 @@
+#import torch_xla
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, ConcatDataset , Dataset
+from torchvision import transforms, datasets, utils
+from PIL import Image
+import os
+import kagglehub
+import torch.autograd as autograd
+import matplotlib.pyplot as plt
+import pandas as pd
+#import torch_xla.core.xla_model as xm
+#import torch_xla.distributed.parallel_loader as pl
+
+import torch.nn.functional as F
+import csv
+# Reduce batch size to save memory
+batch_size = 4  # Adjusted from 8
+
+# Move data to TPU-efficient loader
+#source_loader = pl.MpDeviceLoader(
+ #   DataLoader(source_dataset, batch_size=batch_size, shuffle=True), xm.xla_device()
+#)
+#transform_loader = pl.MpDeviceLoader(
+#    DataLoader(transform_dataset, batch_size=batch_size, shuffle=True), xm.xla_device()
+#)
+
+# Adjust training function to include xm.mark_step()
+def train_deepkeygen(generator, critic, source_loader, transform_loader, num_epochs, lr, device):
+    optimizer_g = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.9))
+    optimizer_d = optim.Adam(critic.parameters(), lr=lr, betas=(0.5, 0.9))
+    lambda_gp = 10
+    critic_iterations = 5
+
+    start_epoch = load_checkpoint(generator, critic, optimizer_g, optimizer_d)
+    csv_path = "/content/drive/MyDrive/cip/metrics/metrices.csv"
+    #/content/drive/MyDrive/metrices/metrices.csv
+    #/content/drive/MyDrive/Sem6/CIP_Team6_2025/WGAN_GP_working/metrices.csv
+    if not os.path.exists(csv_path):
+        with open(csv_path, "w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["Epoch", "Generator Loss", "Critic Loss", "Wasserstein Distance", "Gradient Penalty", "D_real", "D_fake", "Gen_Acc", "Critic_Acc"])
+
+    for epoch in range(start_epoch, num_epochs):
+        print(f"Epoch: {epoch + 1}/{num_epochs}", flush=True)
+        total_gen_correct = 0
+        total_critic_correct = 0
+        total_samples = 0
+        for source_batch, transform_batch in zip(source_loader, transform_loader):
+            source_imgs, _ = source_batch  # Extract images, ignore labels
+            transform_imgs, _ = transform_batch  # Extract images, ignore labels
+
+            source_imgs = source_imgs.to(device)
+            transform_imgs = transform_imgs.to(device)
+
+            for _ in range(critic_iterations):
+                fake_imgs = generator(source_imgs).detach()
+                real_scores = critic(transform_imgs)
+                fake_scores = critic(fake_imgs)
+
+                real_loss = real_scores.mean()
+                fake_loss = fake_scores.mean()
+                gp = compute_gradient_penalty(critic, transform_imgs, fake_imgs, device)
+                critic_loss = fake_loss - real_loss + lambda_gp * gp
+
+                optimizer_d.zero_grad()
+                critic_loss.backward()
+                xm.optimizer_step(optimizer_d)
+                xm.mark_step()  # Free TPU memory
+
+                total_samples += real_scores.size(0) + fake_scores.size(0)
+                total_critic_correct += (real_scores > 0).sum().item() + (fake_scores < 0).sum().item()
+
+            fake_imgs = generator(source_imgs)
+            fake_scores = critic(fake_imgs)
+            generator_loss = -fake_scores.mean()
+
+            optimizer_g.zero_grad()
+            generator_loss.backward()
+            xm.optimizer_step(optimizer_g)
+            xm.mark_step()  # Free TPU memory
+
+            total_gen_correct += (fake_scores > 0).sum().item()
+
+
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss D: {critic_loss.item()}, Loss G: {generator_loss.item()}", flush=True)
+        gen_acc = (total_gen_correct / total_samples) * 100
+        critic_acc = (total_critic_correct / total_samples) * 100
+        wasserstein_distance = real_loss.item() - fake_loss.item()
+
+        with open(csv_path, "a", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow([epoch+1, generator_loss.item(), critic_loss.item(), wasserstein_distance, gp.item(), real_loss.item(), fake_loss.item(), gen_acc, critic_acc])
+
+        if (epoch + 1) % 3 == 0:
+            save_checkpoint(generator, critic, optimizer_g, optimizer_d, epoch)
+        sample_image, _ = next(iter(source_loader))  # Extract one batch
+        sample_image = sample_image[:1]  # Select only one image (batch size 1)
+        save_generated_images(generator, epoch, device, sample_image)
+
+    print("[+] Training ended", flush=True)
+
+
+
+data = []
+drive_checkpoint_link = "/content/drive/MyDrive/cip/checkpoint/deepkeygen_checkpoint_new.pth"
+# /checkpoints/deepkeygen_checkpoint.pth
+#/content/drive/MyDrive/Sem6/CIP_Team6_2025/WGAN_GP_working/deepkeygen_checkpoint.pth
+
+# Function to download multiple datasets
+def download_datasets(dataset_list):
+    dataset_dirs = [kagglehub.dataset_download(dataset) for dataset in dataset_list]
+    return dataset_dirs
+
+# Function to load multiple datasets into a single DataLoader
+def load_multiple_datasets(data_dirs, transform, batch_size):
+    datasets_list = [datasets.ImageFolder(data_dir, transform=transform) for data_dir in data_dirs]
+    combined_dataset = ConcatDataset(datasets_list)
+    return DataLoader(combined_dataset, batch_size=batch_size, shuffle=True)
+
+def save_checkpoint(generator, critic, optimizer_g, optimizer_d, epoch, filepath=drive_checkpoint_link):
+    checkpoint = {
+        'epoch': epoch,
+        'generator_state_dict': generator.state_dict(),
+        'critic_state_dict': critic.state_dict(),
+        'optimizer_g_state_dict': optimizer_g.state_dict(),
+        'optimizer_d_state_dict': optimizer_d.state_dict()
+    }
+    torch.save(checkpoint, filepath)
+    print(f"[+]Checkpoint saved at epoch {epoch+1}")
+
+def load_checkpoint(generator, critic, optimizer_g, optimizer_d, filepath=drive_checkpoint_link, device=None):
+    if os.path.exists(drive_checkpoint_link) and os.path.getsize(filepath) > 0:  # Check if file exists and has content
+        try:
+            checkpoint = torch.load(filepath, map_location=device)
+
+            # Load generator and critic selectively, filtering mismatched weights
+            generator_dict = checkpoint['generator_state_dict']
+            critic_dict = checkpoint['critic_state_dict']
+
+            generator_model_dict = generator.state_dict()
+            critic_model_dict = critic.state_dict()
+
+            generator_dict = {k: v for k, v in generator_dict.items() if k in generator_model_dict and v.shape == generator_model_dict[k].shape}
+            critic_dict = {k: v for k, v in critic_dict.items() if k in critic_model_dict and v.shape == critic_model_dict[k].shape}
+
+            generator_model_dict.update(generator_dict)
+            critic_model_dict.update(critic_dict)
+
+            generator.load_state_dict(generator_model_dict)
+            critic.load_state_dict(critic_model_dict)
+
+            try:
+                optimizer_g.load_state_dict(checkpoint['optimizer_g_state_dict'])
+                optimizer_d.load_state_dict(checkpoint['optimizer_d_state_dict'])
+                print("[+] Optimizers loaded successfully")
+            except ValueError as e:
+                print(f"[-] Skipping optimizer state loading due to mismatch: {e}")
+                print("[!] Reinitializing optimizers")
+                optimizer_g.param_groups = []  # Reset optimizer
+                optimizer_d.param_groups = []
+
+
+            start_epoch = checkpoint['epoch'] + 1
+            print(f"[+] Resuming training from epoch {start_epoch}")
+        except RuntimeError as e:
+            print(f"[-] Error loading checkpoint: {e}")  # Print error message if loading fails
+            start_epoch = 0  # Start from epoch 0 if loading fails
+            print("[-] Starting training from scratch due to checkpoint loading error.")
+    else:
+        start_epoch = 0
+        print("[!] No checkpoint found, starting training from scratch.")
+
+    return start_epoch
+
+
+
+# class PairedMedicalDataset(Dataset):
+#     def __init__(self, source_dir, transform_dir, transform):
+#         self.source_images = sorted(os.listdir(source_dir))
+#         self.transform_images = sorted(os.listdir(transform_dir))
+#         self.source_dir = source_dir
+#         self.transform_dir = transform_dir
+#         self.transform = transform
+
+#     def __len__(self):
+#         return len(self.source_images)
+
+#     def __getitem__(self, idx):
+#         source_path = os.path.join(self.source_dir, self.source_images[idx])
+#         transform_path = os.path.join(self.transform_dir, self.transform_images[idx])
+
+#         source_img = Image.open(source_path).convert("RGB")
+#         transform_img = Image.open(transform_path).convert("RGB")
+
+#         source_img = self.transform(source_img)
+#         transform_img = self.transform(transform_img)
+
+#         return source_img, transform_img
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels):
+        super(ResidualBlock, self).__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.InstanceNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.InstanceNorm2d(in_channels)
+        )
+
+    def forward(self, x):
+        return F.relu(x + self.block(x))  # Residual Connection
+#return F.relu(x+self.block(x))
+
+# Generator Network (G)
+class Generator(nn.Module):
+    def __init__(self):
+        super(Generator, self).__init__()
+
+        # Encoder (Downsampling)
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=1, padding=3, bias=False),
+            nn.InstanceNorm2d(64),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+
+        # Bottleneck (Residual Blocks)
+        self.res_blocks = nn.Sequential(*[ResidualBlock(256) for _ in range(6)])
+
+        # Decoder (Upsampling)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False),
+            nn.InstanceNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False),
+            nn.InstanceNorm2d(64),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(64, 3, kernel_size=7, stride=1, padding=3, bias=False),
+            nn.Tanh()  # Output in range [-1,1]
+        )
+
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.res_blocks(x)
+        x = self.decoder(x)
+        return x
+
+
+# Critic (Discriminator) Network (D)
+class Critic(nn.Module):
+    def __init__(self):
+        super(Critic, self).__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(256, 512, kernel_size=4, stride=1, padding=1, bias=False),
+            nn.InstanceNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(512, 1, kernel_size=4, stride=1, padding=1, bias=False),
+            # to be removed - coz critic uses raw scores to output and not probabilities
+        )
+
+    def forward(self, x):
+        return self.model(x).view(-1)
+
+def compute_gradient_penalty(critic, real_samples, fake_samples, device):
+    min_batch_size = min(real_samples.size(0), fake_samples.size(0))
+    real_samples = real_samples[:min_batch_size]
+    fake_samples = fake_samples[:min_batch_size]
+
+    if real_samples.shape != fake_samples.shape:
+      print(f"Shape mismatch: real_samples: {real_samples.shape}, fake_samples: {fake_samples.shape}")
+
+    # Create random alpha values for interpolation
+    alpha = torch.rand(real_samples.shape[0], 1, 1, 1, device=device)  # Random alpha for each image in the batch
+
+    # Expand alpha to match the spatial dimensions of the image (8, 3, 256, 256)
+    alpha = alpha.view(real_samples.shape[0], 1, 1, 1).expand_as(real_samples)
+
+
+    # Interpolate between real and fake samples
+    interpolates = alpha * real_samples + (1 - alpha) * fake_samples
+    interpolates.requires_grad_(True)
+
+    # Pass the interpolates through the critic
+    critic_interpolates = critic(interpolates)
+
+    # Compute gradients of the critic's output w.r.t. interpolates
+    grad_outputs = torch.ones_like(critic_interpolates, device=device)
+
+    gradients = torch.autograd.grad(
+        outputs=critic_interpolates,
+        inputs=interpolates,
+        grad_outputs=grad_outputs,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True
+    )[0]
+
+    # Flatten the gradients and compute the gradient penalty
+    gradients = gradients.view(gradients.shape[0], -1)
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1 + 1e-6) ** 2).mean()
+
+    return gradient_penalty
+
+
+
+def save_generated_images(generator, epoch, device, sample_image):
+    generator.eval()
+    with torch.no_grad():
+        sample_image = sample_image.to(device)  # Ensure it's on the right device
+        fake_img = generator(sample_image).squeeze(0)  # Shape: (3, 256, 256)
+
+        image_dir = "/content/drive/MyDrive/cip/generated_images"
+        os.makedirs(image_dir, exist_ok=True)
+        image_path = f"{image_dir}/epoch_{epoch}.png"
+        #/content/drive/MyDrive/Sem6/CIP_Team6_2025/WGAN_GP_working/Images
+        #generated_images/epoch_{epoch}.png
+
+        # Save image with correct size
+        utils.save_image(fake_img, image_path, normalize=True)
+
+    generator.train()
+
+
+
+# Main script
+if __name__ == "__main__":
+    print(f"[+] Current working directory: {os.getcwd()}")
+
+    device = xm.xla_device()  # Use TPU device
+    #device = torch.device("cuda" if torch.cuda.is_available() else "cpu" )
+    #device = torch.device("cuda")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu" )
+    print(f"[+] Using device: {device}")
+
+    #csvpath = "/content/loss.csv"
+
+    #source_datasets = ["raddar/tuberculosis-chest-xrays-montgomery", "masoudnickparvar/brain-tumor-mri-dataset"]
+    #source_data_dirs = download_datasets(source_datasets)  # Download datasets from Kaggle
+
+    # **Define Paths for Source & Transformed Data**
+    source_dir = "/content/source"  # Directory containing original medical images
+    transform_dir = "/content/transformation"  # Directory containing transformed keys
+
+    # **Load Datasets**
+    batch_size = 8
+    num_epochs = 250
+    lr = 0.0002
+    transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
+    source_dataset = datasets.ImageFolder(source_dir, transform=transform)
+    transform_dataset = datasets.ImageFolder(transform_dir, transform=transform)
+
+    # **Create Data Loaders**
+    source_loader = DataLoader(source_dataset, batch_size=batch_size, shuffle=True)
+    transform_loader = DataLoader(transform_dataset, batch_size=batch_size, shuffle=True)
+
+    print("[+] Datasets loaded successfully!")
+
+
+    generator = Generator().to(device)
+    critic = Critic().to(device)
+
+    print("[+] Training begins")
+    train_deepkeygen(generator, critic, source_loader, transform_loader, num_epochs, lr, device)
+    print("[+] Training ended")
+
+
