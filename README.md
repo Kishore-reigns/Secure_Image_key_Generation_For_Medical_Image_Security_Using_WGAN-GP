@@ -12,18 +12,36 @@ Traditional key generation techniques often suffer from low entropy or training 
 This system ensures strong encryption, reduced correlation, high unpredictability, and superior performance compared to classical models.
 
 ## 📂 Repository Structure
-
-```
-📁 Draw.io files                 → Architecture and diagram sources  
-📁 Final_Training                → Final training data, logs or models  
+📁 Draw.io files                  → Architecture and diagram sources  
+📁 Final_Training                 → Final training data, logs or models  
 📁 Medical_Images_for_rough_test → Sample medical images used for testing  
-📁 Models                        → Saved GAN models  
-📁 PythonFiles                   → Utility and core implementation scripts  
-📁 WGAN_GP_working               → WGAN-GP training and evaluation logic  
-📁 ppts                          → Project presentation slides  
-📄 simple_ui_using_TKinter.py    → UI demo for image-key generation  
-📄 README.md                     → This file  
-```
+📁 Models                         → Saved Checkpoint after training it for ~250 epochs  
+📁 ppts                           → Project presentation slides  
+📁 WGAN_GP_working                → WGAN-GP training and evaluation logic  
+
+📁 PythonFiles                    → Utility and core implementation scripts  
+│
+├── Utils.py              → Common utility functions used across the project.  
+├── Utils_.py             → Variant of Utils with additional or experimental utilities.  
+├── cryptoSystem.py       → Core encryption and decryption system logic.  
+├── decrypt_randomness.py → Functions for randomness handling during decryption.  
+├── desktop.ini           → System-generated file storing folder view settings (not project-related).  
+├── graphs.py             → Code for plotting evaluation graphs and metrics.  
+├── index.py              → Main entry script for orchestrating model execution.  
+├── metrices.csv          → Stores recorded model evaluation metrics (e.g. accuracy, loss).  
+├── nist__python.py       → Implements NIST randomness tests (version 1).  
+├── nist_py.py            → Implements NIST randomness tests (version 2 or updated).  
+├── nist_test.py          → Executes and evaluates NIST test suite results.  
+├── one_time_pad_test.py  → Testing logic for one-time pad encryption methods.  
+├── otp_thesis.py         → Thesis-specific code applying OTP logic in real scenarios.  
+├── paper.py              → Script used to generate or analyze content for research paper.  
+├── ui.py                 → Basic UI interactions for user inputs and actions.  
+├── wgan_gp.py            → Implements WGAN-GP model logic and training routines.  
+└── wgp.py                → Additional or refined implementation of WGAN-GP or helper model.  
+
+📄 simple_ui_using_TKinter.py     → UI demo for image-key generation  
+📄 README.md                      → This file
+
 
 ## 🔧 Technologies & Libraries
 
